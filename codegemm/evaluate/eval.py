@@ -5,9 +5,11 @@ from tqdm import tqdm
 import torch
 from .helpers.utils import vprint, logprint, get_tokenizer_type, name_splitter, base_model_name_to_hf_repo_name
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.tokenization_utils_base import BatchEncoding
 from codegemm.inference.codegemm_causallm import CodeGEMMForCausalLM
 import os
 import json
+import pickle
 import lm_eval
 
 current_dir = os.path.dirname(os.path.realpath(__file__))
@@ -268,7 +270,15 @@ def _load_input_tokens(tokenizer_type, testcase_name, tokenizer, verbose):
     input_tokens_cache_path = f"{current_dir}/input_tokens_cache/dataloader-{tokenizer_type}-{testcase_name}-test.pt"
     if tokenizer_type and os.path.exists(input_tokens_cache_path):
         logprint(verbose, f"Loading cached input tokens from {input_tokens_cache_path}...")
-        input_tokens = torch.load(input_tokens_cache_path)
+        try:
+            input_tokens = torch.load(input_tokens_cache_path)
+        except pickle.UnpicklingError:
+            # PyTorch 2.6 changed torch.load default to weights_only=True.
+            # Older caches stored a full BatchEncoding object, so fall back
+            # to trusted local loading for backward compatibility.
+            input_tokens = torch.load(input_tokens_cache_path, weights_only=False)
+        if isinstance(input_tokens, dict) and not isinstance(input_tokens, BatchEncoding):
+            input_tokens = BatchEncoding(input_tokens)
     else:
         logprint(verbose, "Loading test set...")
 
@@ -282,6 +292,6 @@ def _load_input_tokens(tokenizer_type, testcase_name, tokenizer, verbose):
             logprint(verbose, f"Caching input tokens to {input_tokens_cache_path}...")
             # we must create the directory if it doesn't exist
             os.makedirs(os.path.dirname(input_tokens_cache_path), exist_ok=True)
-            torch.save(input_tokens, input_tokens_cache_path)
+            torch.save(dict(input_tokens), input_tokens_cache_path)
 
     return input_tokens

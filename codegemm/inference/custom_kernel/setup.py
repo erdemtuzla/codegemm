@@ -12,6 +12,9 @@ setup(
                 'cxx': ["-O3", "-DENABLE_BF16"],
                 'nvcc': [
                     '-lineinfo', 
+                    # Allow CUDA kernel template instantiations defined in another
+                    # translation unit to link correctly with the shared extension.
+                    '-static-global-template-stub=false',
                     "-U__CUDA_NO_HALF_OPERATORS__",
                     "-U__CUDA_NO_HALF_CONVERSIONS__",
                     "-U__CUDA_NO_HALF2_OPERATORS__",

@@ -4,15 +4,15 @@ import argparse
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from codegemm.inference.codegemm_causallm import CodeGEMMForCausalLM
 from codegemm.evaluate import eval
+from codegemm.utils.run_logging import setup_run_log
 
-print("""This script will evaluate all models in the cache directory by:
+STARTUP_MESSAGE = """This script will evaluate all models in the cache directory by:
     1. Calculating perplexity on specified datasets, and
     2. Evaluating downstream tasks using lm_eval on specified tasks.
     
 To view and modify the datasets and tasks to be evaluated, please modify this script directly.
 Also check the provided command line arguments for more options.
-""")
-
+"""
 
 def get_tokenizer_type(model_path):
     if 'llama-2' in model_path.lower():
@@ -34,12 +34,30 @@ def get_tokenizer_type(model_path):
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--model_path', type=str, default='')
+parser.add_argument('--tokenizer_path', type=str, default=None,
+                    help='Tokenizer path or Hugging Face repo. Default: model_path')
 parser.add_argument('--output_file', type=str, default='results.json')
 parser.add_argument('--redo', action='store_true')
 parser.add_argument('--cache_dir', type=str, default='./cache')
 parser.add_argument('--downstream', action='store_true')
 parser.add_argument('--fp16', action='store_true')
+parser.add_argument('--datasets', type=str, default=None,
+                    help='Comma-separated perplexity datasets to evaluate. Default: wikitext2')
+parser.add_argument('--tasks', type=str, default=None,
+                    help='Comma-separated lm-eval tasks. Default: mmlu, or CSR tasks with --downstream')
+parser.add_argument('--skip_lm_eval', action='store_true',
+                    help='Only run perplexity evaluation and skip lm-eval tasks.')
+parser.add_argument('--skip_failed_lm_eval', action='store_true',
+                    help='Keep saved perplexity results and continue if lm-eval cannot load a dataset.')
+parser.add_argument('--num_fewshot', type=int, default=None,
+                    help='Override the few-shot count used for lm-eval.')
+parser.add_argument('--log_dir', type=str, default='history',
+                    help='Directory for timestamped run logs. Default: history')
 args = parser.parse_args()
+
+log_path = setup_run_log("run_eval", args.log_dir, args.model_path)
+print(STARTUP_MESSAGE)
+print(f">> Run log: {log_path}")
 
 model_paths = []
 # num_fewshot = 5
@@ -55,19 +73,31 @@ model_paths = []
 
 # testcases for perplexity calculation
 # datasets = ['wikitext2', 'c4_new', 'ptb_new_sliced']
-datasets = ['wikitext2', 'c4_new']
+if args.datasets is None:
+    datasets = ['wikitext2']
+else:
+    datasets = [dataset.strip() for dataset in args.datasets.split(',') if dataset.strip()]
 
 # tasks for lm_eval
 if args.downstream:
-    tasks = ['winogrande', 'piqa', 'arc_easy', 'arc_challenge', 'hellaswag']
+    default_tasks = ['winogrande', 'piqa', 'arc_easy', 'arc_challenge', 'hellaswag']
     # tasks = ['hellaswag']
     # tasks = []
-    num_fewshot = 0
+    default_num_fewshot = 0
     # tasks = ['gsm8k_cot']
     # num_fewshot = 8
 else:
-    tasks = ['mmlu']
-    num_fewshot = 5
+    default_tasks = ['mmlu']
+    default_num_fewshot = 5
+
+if args.skip_lm_eval:
+    tasks = []
+elif args.tasks is None:
+    tasks = default_tasks
+else:
+    tasks = [task.strip() for task in args.tasks.split(',') if task.strip()]
+
+num_fewshot = default_num_fewshot if args.num_fewshot is None else args.num_fewshot
 
 # read previous results
 if os.path.exists(args.output_file):
@@ -138,7 +168,7 @@ for i, model_path in enumerate(total_tests_to_run):
 
     # Run evaluation
     # tokenizer_type, tokenizer, model = eval.auto_model_load(model_path, args.fp16)
-    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-3B-Instruct")
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path or model_path)
     # model = AnyBCQForCausalLM.from_quantized(model_path).to(device)
     model = CodeGEMMForCausalLM.from_quantized(model_path).to("cuda")
     tokenizer_type = get_tokenizer_type(model_path)
@@ -159,7 +189,15 @@ for i, model_path in enumerate(total_tests_to_run):
 
     # Run lm_eval
     if tasks_to_evaluate:
-        lm_eval_results = eval.run_lm_eval(tokenizer, model, tasks_to_evaluate, num_fewshot)
+        try:
+            lm_eval_results = eval.run_lm_eval(tokenizer, model, tasks_to_evaluate, num_fewshot)
+        except ConnectionError as exc:
+            if not args.skip_failed_lm_eval:
+                print(">> lm-eval could not load a dataset. Perplexity results were saved before this failure.")
+                print(">> Fix Hugging Face Hub access or pre-cache the lm-eval dataset, then rerun.")
+                raise
+            print(f">> Skipping lm-eval because a dataset could not be reached: {exc}")
+            print(">> To run MMLU, make sure the lm-eval datasets are available in the Hugging Face cache or that the Hub is reachable.")
 
     # Update lm_eval results
     if lm_eval_results:

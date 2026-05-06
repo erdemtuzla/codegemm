@@ -2,6 +2,8 @@ from huggingface_hub import snapshot_download
 import argparse
 import os
 
+from codegemm.utils.run_logging import setup_run_log
+
 def download_model(repo_id, local_dir=None, cache_dir=None):
     """
     Download a Hugging Face model to a local directory.
@@ -34,6 +36,10 @@ if __name__ == "__main__":
                        help="Local directory to save the model")
     parser.add_argument("--cache_dir", type=str, default=None,
                        help="Hugging Face cache directory")
+    parser.add_argument("--log_dir", type=str, default="history",
+                       help="Directory for timestamped run logs. Default: history")
     
     args = parser.parse_args()
+    log_path = setup_run_log("download_model", args.log_dir, args.local_dir or args.repo_id)
+    print(f">> Run log: {log_path}")
     download_model(args.repo_id, args.local_dir, args.cache_dir)

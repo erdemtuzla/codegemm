@@ -3,6 +3,7 @@
 
 import os
 import time
+import inspect
 from argparse import Namespace
 from itertools import chain
 from typing import Any, Dict, Iterable, Optional, Sequence, Tuple
@@ -28,6 +29,7 @@ from codegemm.quantization.modelutils import (
     save_not_quantized_weights,
 )
 from codegemm.quantization.utils import using_tf32
+from codegemm.utils.run_logging import setup_run_log
 
 try:
     import wandb
@@ -99,6 +101,11 @@ def get_inps(
             model.model.decoder.embed_positions = model.model.decoder.embed_positions.to(device)
             if hasattr(model.model.decoder, "project_in") and model.model.decoder.project_in:
                 model.model.decoder.project_in = model.model.decoder.project_in.to(device)
+    rotary_emb = getattr(getattr(model, "model", None), "rotary_emb", None)
+    rotary_emb_device = None
+    if rotary_emb is not None:
+        rotary_emb_device = next(rotary_emb.buffers(), torch.empty(0, device=device)).device
+        rotary_emb.to(device)
     device = emb.weight.device  # now default device is the one where the embeddings are.
     layer_device = next(layers[0].parameters()).device
     layers[0] = layers[0].to(device)
@@ -114,7 +121,12 @@ def get_inps(
         )
         for i in range(len(devices))
     ]
-    forward_arg_names = ["attention_mask", "position_ids"]
+    layer_forward_params = inspect.signature(layers[0].forward).parameters
+    accepts_any_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in layer_forward_params.values())
+    forward_arg_names = [
+        name for name in ("attention_mask", "position_ids")
+        if accepts_any_kwargs or name in layer_forward_params
+    ]
     if model.config.model_type.lower() in FALCON_TYPES:
         forward_arg_names.append("alibi")
 
@@ -153,6 +165,8 @@ def get_inps(
 
     layers[0] = layers[0].to(layer_device)
     model.get_input_embeddings().to(emb_device)
+    if rotary_emb is not None and rotary_emb_device is not None:
+        rotary_emb.to(rotary_emb_device)
     if model.config.model_type == "opt":
         model.model.decoder.embed_positions = model.model.decoder.embed_positions.to(emb_device)
         if hasattr(model.model.decoder, "project_in") and model.model.decoder.project_in:
@@ -857,6 +871,12 @@ def main():
         action="store_true",
         help="Whether to trust remote code.",
     )
+    parser.add_argument(
+        "--log_dir",
+        type=str,
+        default="history",
+        help="Directory for timestamped run logs. Default: history",
+    )
 
     torch.set_num_threads(min(16, torch.get_num_threads()))
     torch.backends.cudnn.allow_tf32 = False
@@ -865,6 +885,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     args = parser.parse_args()
+    log_path = setup_run_log("run_quant", args.log_dir, args.save or args.model_path)
+    print(f">> Run log: {log_path}")
     if args.devices is None:
         if torch.cuda.is_available():
             args.devices = [torch.device(f"cuda:{i}") for i in range(torch.cuda.device_count())]

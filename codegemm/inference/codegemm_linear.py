@@ -81,10 +81,10 @@ class CodeGEMMLinear(nn.Module):
 
     def _gemm(self, x):
         """
-        x : (B, T, in_features)
-        return -> (B, T, out_features)
+        x : (B, T, in_features) or (N, in_features)
+        return -> (B, T, out_features) or (N, out_features)
         """
-        B, T, _ = x.shape
+        original_shape = x.shape
         weight = codegemm_dequant(
             self.codes, self.scales, self.codebooks, self.group_size
         )
@@ -92,7 +92,7 @@ class CodeGEMMLinear(nn.Module):
         x_flat = x.reshape(-1, self.in_features)
         y_flat = torch.matmul(x_flat, weight)
 
-        return y_flat.reshape(B, T, self.out_features)
+        return y_flat.reshape(*original_shape[:-1], self.out_features)
 
     def forward(self, x, **kwargs):
         """

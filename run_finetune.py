@@ -43,6 +43,7 @@ from codegemm.quantization.pv_utils import (
     split_quantized_weights_between_ranks,
 )
 from codegemm.quantization.utils import IntCodes, is_signed, master_rank_first, one_rank_at_a_time
+from codegemm.utils.run_logging import setup_run_log
 
 try:
     import wandb
@@ -1012,7 +1013,15 @@ def main():
     add_model_args(parser)
     add_data_args(parser)
     add_finetuning_args(parser)
+    parser.add_argument(
+        "--log_dir",
+        type=str,
+        default="history",
+        help="Directory for timestamped run logs. Default: history",
+    )
     args = parser.parse_args()
+    log_path = setup_run_log("run_finetune", args.log_dir, args.save or args.quantized_model)
+    print(f">> Run log: {log_path}")
 
     assert torch.distributed.is_initialized()
     assert args.batch_size is not None, "please specify batch size"

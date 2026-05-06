@@ -15,6 +15,8 @@ def get_num_layers(config) -> int:
     match config.model_type:
         case "llama" | "mistral" | "mixtral" | "gemma" | "phi3" | "qwen2":
             return config.num_hidden_layers
+        case "opt":
+            return config.num_hidden_layers
         case unknown_type:
             raise NotImplementedError(f"Can't get number of layers for {unknown_type}")
 
@@ -98,7 +100,10 @@ def swap_quant_model(
     
     # Default layers to replace
     if layers_to_replace is None:
-        layers_to_replace = ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']
+        if config.model_type == "opt":
+            layers_to_replace = ['q_proj', 'k_proj', 'v_proj', 'out_proj', 'fc1', 'fc2']
+        else:
+            layers_to_replace = ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']
     
     num_layers = get_num_layers(config)
     layers_prefix = get_layers_prefix(config)
@@ -113,8 +118,9 @@ def swap_quant_model(
                 print(f"Warning: {layer_path} not found, skipping layer {layer_idx}")
                 continue
             
-            
-            quantized_layer = torch.load(layer_path)
+            # run_quant.py writes full layer modules, not plain tensor state dicts.
+            # Only use this path for locally produced/trusted quantization artifacts.
+            quantized_layer = torch.load(layer_path, weights_only=False)
             print(f"\nProcessing layer {layer_idx}...")
             
             # Build a mapping of submodule names to their parameters
@@ -241,6 +247,8 @@ def get_layers_prefix(config) -> str:
     match config.model_type:
         case "llama" | "mistral" | "mixtral" | "gemma" | "phi3" | "qwen2":
             return "model.layers"
+        case "opt":
+            return "model.decoder.layers"
         case unknown_type:
             raise NotImplementedError(f"Can't get layers prefix for {unknown_type}")
 

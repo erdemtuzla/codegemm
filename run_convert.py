@@ -10,6 +10,8 @@ import torch
 from tqdm.auto import trange
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
+from codegemm.utils.run_logging import setup_run_log
+
 try:
     import safetensors
 except ModuleNotFoundError:
@@ -38,6 +40,8 @@ def get_num_layers(config) -> int:
     match config.model_type:
         case "llama" | "mistral" | "mixtral" | "gemma" | "phi3" | "qwen2":
             return config.num_hidden_layers
+        case "opt":
+            return config.num_hidden_layers
         case unknown_type:
             raise NotImplementedError(f"Can't get number of layers for {unknown_type}")
 
@@ -46,6 +50,8 @@ def get_layers_prefix(config) -> str:
     match config.model_type:
         case "llama" | "mistral" | "mixtral" | "gemma" | "phi3" | "qwen2":
             return "model.layers"
+        case "opt":
+            return "model.decoder.layers"
         case unknown_type:
             raise NotImplementedError(f"Can't get layers prefix for {unknown_type}")
 
@@ -157,7 +163,15 @@ if __name__ == "__main__":
         action="store_true",
         help="Whether to swap nn.Linear with CodeGEMMLinear in place instead of saving state_dict",
     )
+    parser.add_argument(
+        "--log_dir",
+        type=str,
+        default="history",
+        help="Directory for timestamped run logs. Default: history",
+    )
     args = parser.parse_args()
+    log_path = setup_run_log("run_convert", args.log_dir, args.out_path or args.in_path)
+    print(f">> Run log: {log_path}")
 
     old_config = AutoConfig.from_pretrained(args.model, trust_remote_code=args.trust_remote_code, cache_dir=args.cache_dir)
     metadata = get_metadata(args.in_path)
@@ -201,6 +215,17 @@ if __name__ == "__main__":
                 "mlp.gate_proj",
                 "mlp.up_proj",
                 "mlp.down_proj"
+            ]
+        elif model_type == "opt":
+            layers_name = "layers"
+            model_name = "model.decoder"
+            module_names = [
+                "self_attn.q_proj",
+                "self_attn.k_proj",
+                "self_attn.v_proj",
+                "self_attn.out_proj",
+                "fc1",
+                "fc2",
             ]
         else:
             raise NotImplementedError(f"Arch config not defined for {model_type}")

@@ -64,6 +64,36 @@ void codegemm_gemv_templated(
     TORCH_CHECK(err == cudaSuccess, "CUDA Error: ", cudaGetErrorString(err));
 }
 
+void codegemm_gemv_b8_generic(
+    torch::Tensor input,
+    torch::Tensor output,
+    torch::Tensor q_weight,
+    torch::Tensor alpha,
+    torch::Tensor codebook,
+    int group_size,
+    int num_codebook,
+    int len_vector,
+    cudaStream_t stream
+) {
+    uint32_t kSize = input.size(2);
+    uint32_t mSize = output.size(2);
+
+    dim3 grid((mSize + NUM_THREADS - 1) / NUM_THREADS);
+    dim3 block(NUM_THREADS);
+
+    _codegemm_gemv_b8_generic<<<grid, block, 0, stream>>>(
+        (uint32_t*) q_weight.data_ptr<int32_t>(),
+        (__half*) alpha.data_ptr<at::Half>(),
+        (__half*) codebook.data_ptr<at::Half>(),
+        (__half*) input.data_ptr<at::Half>(),
+        (__half*) output.data_ptr<at::Half>(),
+        mSize, kSize, group_size, num_codebook, len_vector
+    );
+
+    cudaError_t err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, "CUDA Error: ", cudaGetErrorString(err));
+}
+
 void codegemm_gemv_stream(
     torch::Tensor input,
     torch::Tensor output,
@@ -105,15 +135,23 @@ void codegemm_gemv_stream(
     
     int num_codebook = codebook.size(0);
     int len_vector = codebook.size(2);
+    TORCH_CHECK(q_weight.dim() == 3, "q_weight tensor must be 3-dimensional [num_codebook, K/len_vector/4, output_feat].");
+    TORCH_CHECK(q_weight.size(0) == num_codebook, "q_weight first dimension must match codebook num_codebook.");
+    TORCH_CHECK(q_weight.size(2) == mSize, "q_weight output dimension must match output tensor.");
+    TORCH_CHECK(q_weight.size(1) * len_vector * 4 == kSize,
+                "q_weight packed K dimension is incompatible with input and codebook vector length.");
 
     // Dispatch to appropriate template instantiation based on num_codebook and len_vector
     if (num_codebook == 1 && len_vector == 4) {
         codegemm_gemv_templated<1, 4>(input, output, q_weight, alpha, codebook, group_size, stream);
+    } else if (num_codebook == 2 && len_vector == 4) {
+        codegemm_gemv_templated<2, 4>(input, output, q_weight, alpha, codebook, group_size, stream);
     } else if (num_codebook == 2 && len_vector == 8) {
         codegemm_gemv_templated<2, 8>(input, output, q_weight, alpha, codebook, group_size, stream);
     } else {
-        TORCH_CHECK(false, "Unsupported configuration: num_codebook=", num_codebook, ", len_vector=", len_vector, 
-                    ". Supported configurations: (num_codebook=1, len_vector=4) and (num_codebook=2, len_vector=8).");
+        codegemm_gemv_b8_generic(
+            input, output, q_weight, alpha, codebook, group_size, num_codebook, len_vector, stream
+        );
     }
 }
 
@@ -148,6 +186,8 @@ torch::Tensor codegemm_dequant(
     int len_vector = codebook.size(2);
 
     // q_weight shape: [num_codebook][K/len_vector/4][M]
+    TORCH_CHECK(q_weight.dim() == 3, "q_weight tensor must be 3-dimensional [num_codebook, K/len_vector/4, output_feat].");
+    TORCH_CHECK(q_weight.size(0) == num_codebook, "q_weight first dimension must match codebook num_codebook.");
     const int mSize = q_weight.size(2);
     const int kSize = q_weight.size(1) * len_vector * 4;
 
@@ -188,8 +228,21 @@ torch::Tensor codegemm_dequant(
             mSize, kSize, group_size
         );
     } else {
-        TORCH_CHECK(false, "Unsupported configuration: num_codebook=", num_codebook, ", len_vector=", len_vector, 
-                    ". Supported configurations: (num_codebook=1, len_vector=4) and (num_codebook=2, len_vector=8).");
+        weight_transposed = torch::empty({mSize, kSize}, options);
+
+        dim3 generic_block(16, 16);
+        dim3 generic_grid(
+            (q_weight.size(1) + generic_block.x - 1) / generic_block.x,
+            (mSize + generic_block.y - 1) / generic_block.y
+        );
+
+        _codegemm_dequant_b8_generic<<<generic_grid, generic_block, 0, stream>>>(
+            (uint32_t*) q_weight.data_ptr<int32_t>(),
+            (__half*) alpha.data_ptr<at::Half>(),
+            (__half*) codebook.data_ptr<at::Half>(),
+            (__half*) weight_transposed.data_ptr<at::Half>(),
+            mSize, kSize, group_size, num_codebook, len_vector
+        );
     }
 
     cudaError_t err = cudaGetLastError();

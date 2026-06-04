@@ -91,6 +91,86 @@ __global__ void codegemm(
     }
 }
 
+__global__ void _codegemm_gemv_b8_generic(
+    const uint32_t* __restrict__ q_weight,
+    const __half* __restrict__ alpha,
+    const __half* __restrict__ codebook,
+    const __half* __restrict__ input,
+    __half* __restrict__ output,
+    const int M,
+    const int K,
+    const int group_size,
+    const int num_codebook,
+    const int len_vector
+) {
+    const int m = blockIdx.x * blockDim.x + threadIdx.x;
+    if (m >= M) return;
+
+    const int packed_k_size = K / (len_vector * 4);
+    float acc = 0.0f;
+
+    for (int packed_idx = 0; packed_idx < packed_k_size; packed_idx++) {
+        #pragma unroll
+        for (int byte_idx = 0; byte_idx < 4; byte_idx++) {
+            const int k_base = (packed_idx * 4 + byte_idx) * len_vector;
+            const int group_idx = k_base / group_size;
+            const float scale = __half2float(alpha[group_idx * M + m]);
+
+            float vector_dot = 0.0f;
+            for (int cb = 0; cb < num_codebook; cb++) {
+                const uint32_t packed = q_weight[(cb * packed_k_size + packed_idx) * M + m];
+                const uint8_t code = (packed >> (byte_idx * 8)) & 0xFF;
+                const __half* cb_vec = codebook + (cb * 256 + code) * len_vector;
+
+                for (int j = 0; j < len_vector; j++) {
+                    vector_dot += __half2float(cb_vec[j]) * __half2float(input[k_base + j]);
+                }
+            }
+
+            acc += scale * vector_dot;
+        }
+    }
+
+    output[m] = __float2half_rn(acc);
+}
+
+__global__ void _codegemm_dequant_b8_generic(
+    const uint32_t* __restrict__ q_weight,
+    const __half* __restrict__ alpha,
+    const __half* __restrict__ codebook,
+    __half* __restrict__ output,
+    const int M,
+    const int K,
+    const int group_size,
+    const int num_codebook,
+    const int len_vector
+) {
+    const int packed_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row_id = blockIdx.y * blockDim.y + threadIdx.y;
+    const int packed_k_size = K / (len_vector * 4);
+
+    if (packed_idx >= packed_k_size || row_id >= M) return;
+
+    #pragma unroll
+    for (int byte_idx = 0; byte_idx < 4; byte_idx++) {
+        const int k_base = (packed_idx * 4 + byte_idx) * len_vector;
+        const int group_idx = k_base / group_size;
+        const float scale = __half2float(alpha[group_idx * M + row_id]);
+
+        for (int j = 0; j < len_vector; j++) {
+            float value = 0.0f;
+
+            for (int cb = 0; cb < num_codebook; cb++) {
+                const uint32_t packed = q_weight[(cb * packed_k_size + packed_idx) * M + row_id];
+                const uint8_t code = (packed >> (byte_idx * 8)) & 0xFF;
+                value += __half2float(codebook[(cb * 256 + code) * len_vector + j]);
+            }
+
+            output[row_id * K + k_base + j] = __float2half_rn(value * scale);
+        }
+    }
+}
+
 
 template<bool use_bfloat16>
 __global__ void _codegemm_dequant_m2v8(
@@ -313,6 +393,17 @@ template __global__ void codegemm<1, 4>(
 );
 
 template __global__ void codegemm<2, 8>(
+    const uint32_t* q_weight,
+    const __half* alpha,
+    const __half* codebook,
+    const __half* input,
+    __half* output,
+    const int M,
+    const int K,
+    const int group_size
+);
+
+template __global__ void codegemm<2, 4>(
     const uint32_t* q_weight,
     const __half* alpha,
     const __half* codebook,

@@ -2,12 +2,21 @@ import os
 from setuptools import setup
 from torch.utils import cpp_extension
 
+cuda_target_dir = os.path.join(os.environ.get("CUDA_HOME", ""), "targets", "x86_64-linux")
+cuda_target_include = os.path.join(cuda_target_dir, "include")
+cuda_target_lib = os.path.join(cuda_target_dir, "lib")
+
+extra_include_dirs = [cuda_target_include] if os.path.isdir(cuda_target_include) else []
+extra_library_dirs = [cuda_target_lib] if os.path.isdir(cuda_target_lib) else []
+
 setup(
     name="codegemm_kernel",
     ext_modules=[
         cpp_extension.CUDAExtension(
             name="codegemm_kernel", 
             sources=["bindings.cpp", "gemv.cu", "codegemm.cu"],
+            include_dirs=extra_include_dirs,
+            library_dirs=extra_library_dirs,
             extra_compile_args={
                 'cxx': ["-O3", "-DENABLE_BF16"],
                 'nvcc': [

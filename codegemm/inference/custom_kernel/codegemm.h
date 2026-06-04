@@ -34,6 +34,31 @@ __global__ void codegemm(
     const int group_size // group_size
 );
 
+__global__ void _codegemm_gemv_b8_generic(
+    const uint32_t* __restrict__ q_weight,
+    const __half* __restrict__ alpha,
+    const __half* __restrict__ codebook,
+    const __half* __restrict__ input,
+    __half* __restrict__ output,
+    const int M,
+    const int K,
+    const int group_size,
+    const int num_codebook,
+    const int len_vector
+);
+
+__global__ void _codegemm_dequant_b8_generic(
+    const uint32_t* __restrict__ q_weight,
+    const __half* __restrict__ alpha,
+    const __half* __restrict__ codebook,
+    __half* __restrict__ output,
+    const int M,
+    const int K,
+    const int group_size,
+    const int num_codebook,
+    const int len_vector
+);
+
 template<bool use_bfloat16>
 __global__ void _codegemm_dequant_m2v8(
   const uint32_t* __restrict__ q_weight,  // q_weight[num_codebook][K/len_vector/4][M]
@@ -56,4 +81,3 @@ __global__ void _codegemm_dequant_m1v4(
 );
 
 #endif
-

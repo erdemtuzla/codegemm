@@ -1,8 +1,31 @@
 # Originally from https://github.com/snu-mllab/GuidedQuant/blob/main/inference/plugin.py
 
 import torch
-import codegemm_kernel
 
+_CUDA_EXTENSION = None
+
+def _cuda_extension():
+    global _CUDA_EXTENSION
+
+    if _CUDA_EXTENSION is None:
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "The CUDA backend was selected, but CUDA is unavailable. "
+                "Use backend='cpu' for CPU inference"
+            )
+
+        try:
+            import codegemm_kernel
+        except (ImportError, OSError) as exc:
+            raise RuntimeError(
+                "The CUDA backend requires the codegemm_kernel extension. "
+                "Install the existing CUDA extension before using this backend."
+            ) from exc
+
+        _CUDA_EXTENSION = codegemm_kernel
+
+    return _CUDA_EXTENSION
+ 
 
 @torch.library.custom_op("plugin::codegemm_gemv", mutates_args={"output"})
 def codegemm_gemv(
@@ -12,7 +35,7 @@ def codegemm_gemv(
     alpha: torch.Tensor, 
     codebook: torch.Tensor, 
     group_size: int) -> None:
-    codegemm_kernel.codegemm_gemv(
+    _cuda_extension().codegemm_gemv(
         x, output, q_weight, alpha, codebook, group_size)
 
 def codegemm_dequant(
@@ -20,7 +43,7 @@ def codegemm_dequant(
     alpha: torch.Tensor, 
     codebook: torch.Tensor, 
     group_size: int) -> None:
-    weight = codegemm_kernel.codegemm_dequant(
+    weight = _cuda_extension().codegemm_dequant(
         q_weight, alpha, codebook, group_size)
     return weight
 

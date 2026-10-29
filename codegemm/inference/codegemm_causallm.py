@@ -104,8 +104,24 @@ class CodeGEMMForCausalLM(nn.Module):
             fuse_layers=False,
             trust_remote_code=True,
             new_vocab_size=None,
+            backend="cuda",
     ):
         super().__init__()
+
+        if backend not in ("cuda", "cpu"):
+            raise ValueError(f"Unknown CodeGEMM backend: {backend!r}")
+
+        if backend == "cpu" and fuse_layers:
+            raise NotImplementedError(
+                "CPU inference does not support layer fusion."
+            )
+
+        self.backend = backend
+
+        if backend == "cpu":
+            torch_dtype = torch.float32
+
+        self.inference_dtype = torch_dtype
 
         self.config = config
         self.group_size = self.config.codegemm['group_size']
@@ -113,11 +129,32 @@ class CodeGEMMForCausalLM(nn.Module):
         self.num_codebooks = self.config.codegemm['num_codebooks']
         self.nbits_per_codebook = self.config.codegemm['nbits_per_codebook']
 
+        if self.backend == "cpu":
+            metadata = (
+                self.num_codebooks,
+                self.nbits_per_codebook,
+                self.vec_len,
+                self.group_size,
+            )
+
+            if metadata != (2, 8, 8, 128):
+                raise NotImplementedError(
+                    "CPU inference initially supports only "
+                    "m=2, b=8, v=8, g=128."
+                )
+            
+        model_kwargs = {
+            "torch_dtype": torch_dtype,
+            "trust_remote_code": trust_remote_code,
+        }
+
+        if self.backend == "cpu":
+            model_kwargs["attn_implementation"] = "eager"
+
         with init_empty_weights():
             self.model = AutoModelForCausalLM.from_config(
                 config=config,
-                torch_dtype=torch_dtype,
-                trust_remote_code=trust_remote_code,
+                **model_kwargs,
             )
 
         self.analyzer = get_analyzer(self.model)
@@ -126,7 +163,13 @@ class CodeGEMMForCausalLM(nn.Module):
 
         self.tie_weights()
 
-        device_map = {key: 'cpu' for key in self.model.state_dict().keys()}
+        if self.backend == "cpu":
+            device_map = {"": "cpu"}
+        else:
+            device_map = {
+                key: "cpu"
+                for key in self.model.state_dict().keys()
+            }
 
         self.model.resize_token_embeddings(new_vocab_size)
 
@@ -170,7 +213,8 @@ class CodeGEMMForCausalLM(nn.Module):
             trust_remote_code=True,
             fuse_layers=False,
             precisions=None,
-            new_vocab_size=None
+            new_vocab_size=None,
+            backend="cuda",
     ):
         config = cls._load_config(quant_model_path, trust_remote_code)
 
@@ -179,7 +223,8 @@ class CodeGEMMForCausalLM(nn.Module):
             config=config,
             fuse_layers=fuse_layers,
             trust_remote_code=trust_remote_code,
-            new_vocab_size=new_vocab_size
+            new_vocab_size=new_vocab_size,
+            backend=backend,
         )
 
         return codegemm_model
@@ -200,9 +245,14 @@ class CodeGEMMForCausalLM(nn.Module):
                     self.num_codebooks,
                     self.nbits_per_codebook,
                     bias=module.bias is not None,
+                    dtype=self.inference_dtype,
+                    backend=self.backend,
                 )
                 replace_module_by_name(layer, name, wqlinear)
-            torch.cuda.empty_cache()
+
+            if self.backend == "cuda":
+                torch.cuda.empty_cache()
+                
             gc.collect()
 
     def tie_weights(self):

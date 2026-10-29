@@ -75,24 +75,44 @@ def main():
     )
     parser.add_argument("--num_return_sequences", type=int, default=1)
     parser.add_argument("--seed", type=int, default=1234)
-    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--device", type=str, default=None)
     parser.add_argument(
         "--log_dir",
         type=str,
         default="history",
         help="Directory for timestamped run logs. Default: history",
     )
+    parser.add_argument(
+        "--codegemm-backend",
+        choices=("cuda", "cpu"),
+        default="cuda",
+        help="Backend used by compressed CodeGEMM linear layers.",
+    )
     args = parser.parse_args()
+
+    if args.device is None:
+        args.device = args.codegemm_backend
+
+    if torch.device(args.device).type != args.codegemm_backend:
+        parser.error(
+            "--device must match --codegemm-backend: "
+            "CPU backend requires a CPU device; "
+            "CUDA backend requires a CUDA device."
+        )
 
     log_path = setup_run_log("run_generate", args.log_dir, args.model_path)
     print(f">> Run log: {log_path}")
 
-    if args.device.startswith("cuda") and not torch.cuda.is_available():
-        raise RuntimeError("CUDA was requested but torch.cuda.is_available() is false.")
+    if args.codegemm_backend == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA was requested but torch.cuda.is_available() is false."
+            )
 
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
+        torch.manual_seed(args.seed)
         torch.cuda.manual_seed_all(args.seed)
+    else:
+        torch.random.default_generator.manual_seed(args.seed)
 
     prompt = read_prompt(args)
     if not prompt:
@@ -106,7 +126,11 @@ def main():
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = CodeGEMMForCausalLM.from_quantized(args.model_path).to(args.device).eval()
+    model = CodeGEMMForCausalLM.from_quantized(
+        args.model_path,
+        backend=args.codegemm_backend,
+    ).to(args.device).eval()
+
     input_ids = build_inputs(tokenizer, prompt, args).to(args.device)
     attention_mask = torch.ones_like(input_ids, device=args.device)
 
@@ -138,7 +162,7 @@ def main():
             print(f"\n[{index}]")
         print(text)
 
-    if torch.cuda.is_available():
+    if args.codegemm_backend == "cuda":
         print(f"\n>> max_cuda_memory_allocated={torch.cuda.max_memory_allocated():,}")
 
 

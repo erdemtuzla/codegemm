@@ -53,6 +53,12 @@ parser.add_argument('--num_fewshot', type=int, default=None,
                     help='Override the few-shot count used for lm-eval.')
 parser.add_argument('--log_dir', type=str, default='history',
                     help='Directory for timestamped run logs. Default: history')
+parser.add_argument(
+    "--codegemm-backend",
+    choices=("cuda", "cpu"),
+    default="cuda",
+    help="Backend used by compressed CodeGEMM linear layers.",
+)
 args = parser.parse_args()
 
 log_path = setup_run_log("run_eval", args.log_dir, args.model_path)
@@ -170,7 +176,11 @@ for i, model_path in enumerate(total_tests_to_run):
     # tokenizer_type, tokenizer, model = eval.auto_model_load(model_path, args.fp16)
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path or model_path)
     # model = AnyBCQForCausalLM.from_quantized(model_path).to(device)
-    model = CodeGEMMForCausalLM.from_quantized(model_path).to("cuda")
+    model = CodeGEMMForCausalLM.from_quantized(
+        model_path,
+        backend=args.codegemm_backend,
+    ).to(args.codegemm_backend).eval()
+    
     tokenizer_type = get_tokenizer_type(model_path)
 
     

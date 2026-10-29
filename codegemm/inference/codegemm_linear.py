@@ -33,8 +33,32 @@ class CodeGEMMLinear(nn.Module):
         nbits_per_codebook=8,
         bias=False,
         dtype=torch.half,
+        backend="cuda",
     ):
         super().__init__()
+
+        if backend not in ("cuda", "cpu"):
+            raise ValueError(f"Unknown CodeGEMM backend: {backend!r}")
+
+        self.backend = backend
+
+        if backend == "cpu":
+            from codegemm.inference.cpu_ops import validate_config
+
+            validate_config(
+                in_features,
+                out_features,
+                vec_len,
+                group_size,
+                num_codebooks,
+                nbits_per_codebook,
+            )
+            dtype = torch.float32
+        else:
+            from codegemm.inference.plugin import _cuda_extension
+
+            _cuda_extension()
+
         self.in_features = in_features
         self.out_features = out_features
         self.group_size = group_size
@@ -76,7 +100,15 @@ class CodeGEMMLinear(nn.Module):
         else:
             self.bias = None
 
-        self.output = torch.zeros((1, 1, out_features), dtype=self.dtype, device='cuda')
+        self.output = (
+            torch.zeros(
+                (1, 1, out_features),
+                dtype=self.dtype,
+                device="cuda",
+            )
+            if self.backend == "cuda"
+            else None
+        )
 
 
     def _gemm(self, x):
@@ -98,7 +130,18 @@ class CodeGEMMLinear(nn.Module):
         """
         x : (B, T, in_features)
         """
-        
+
+        if self.backend == "cpu":
+            from codegemm.inference.cpu_ops import linear
+
+            return linear(
+                x,
+                self.codes,
+                self.scales,
+                self.codebooks,
+                self.group_size,
+                self.bias,
+            )
         
         if x.numel() // self.in_features == 1:
             self.output.zero_()

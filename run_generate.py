@@ -5,6 +5,14 @@ import torch
 from transformers import AutoTokenizer
 
 from codegemm.inference.codegemm_causallm import CodeGEMMForCausalLM
+from codegemm.inference.cpu_backends import (
+    BACKEND_CHOICES,
+    backend_device_type,
+    canonical_backend,
+    is_cpu_backend,
+    resolve_cpu_threads,
+    validate_backend_platform,
+)
 from codegemm.utils.run_logging import setup_run_log
 
 
@@ -84,16 +92,34 @@ def main():
     )
     parser.add_argument(
         "--codegemm-backend",
-        choices=("cuda", "cpu"),
+        "--backend",
+        choices=BACKEND_CHOICES,
         default="cuda",
         help="Backend used by compressed CodeGEMM linear layers.",
     )
+    parser.add_argument(
+        "--cpu-threads", type=int, default=None,
+        help="Framework CPU threads: auto 1 for cpu-1/2, at most 4 for cpu-3/4.",
+    )
     args = parser.parse_args()
 
-    if args.device is None:
-        args.device = args.codegemm_backend
+    # All CPU variants use CPU tensors. Resolve the implementation name first
+    # and configure threading only here, leaving the Python loading API neutral.
+    args.codegemm_backend = canonical_backend(args.codegemm_backend)
+    device_type = backend_device_type(args.codegemm_backend)
+    try:
+        validate_backend_platform(args.codegemm_backend)
+        if is_cpu_backend(args.codegemm_backend):
+            torch.set_num_threads(resolve_cpu_threads(args.codegemm_backend, args.cpu_threads))
+        elif args.cpu_threads is not None:
+            parser.error("--cpu-threads applies only to CPU backends")
+    except (ValueError, RuntimeError) as exc:
+        parser.error(str(exc))
 
-    if torch.device(args.device).type != args.codegemm_backend:
+    if args.device is None:
+        args.device = device_type
+
+    if torch.device(args.device).type != device_type:
         parser.error(
             "--device must match --codegemm-backend: "
             "CPU backend requires a CPU device; "

@@ -17,6 +17,11 @@ from accelerate.big_modeling import (
 )
 
 from codegemm.inference.codegemm_linear import CodeGEMMLinear
+from codegemm.inference.cpu_backends import (
+    canonical_backend,
+    is_cpu_backend,
+    validate_backend_platform,
+)
 from codegemm.utils.analyzer import get_analyzer
 
 
@@ -108,17 +113,20 @@ class CodeGEMMForCausalLM(nn.Module):
     ):
         super().__init__()
 
-        if backend not in ("cuda", "cpu"):
-            raise ValueError(f"Unknown CodeGEMM backend: {backend!r}")
+        # All CPU variants share loading, dtype, and framework operations; only
+        # compressed linear computation differs. Leave global thread pools alone
+        # here so loading one model cannot silently reconfigure another model.
+        backend = canonical_backend(backend)
+        validate_backend_platform(backend)
 
-        if backend == "cpu" and fuse_layers:
+        if is_cpu_backend(backend) and fuse_layers:
             raise NotImplementedError(
                 "CPU inference does not support layer fusion."
             )
 
         self.backend = backend
 
-        if backend == "cpu":
+        if is_cpu_backend(backend):
             torch_dtype = torch.float32
 
         self.inference_dtype = torch_dtype
@@ -129,7 +137,7 @@ class CodeGEMMForCausalLM(nn.Module):
         self.num_codebooks = self.config.codegemm['num_codebooks']
         self.nbits_per_codebook = self.config.codegemm['nbits_per_codebook']
 
-        if self.backend == "cpu":
+        if is_cpu_backend(self.backend):
             metadata = (
                 self.num_codebooks,
                 self.nbits_per_codebook,
@@ -148,7 +156,7 @@ class CodeGEMMForCausalLM(nn.Module):
             "trust_remote_code": trust_remote_code,
         }
 
-        if self.backend == "cpu":
+        if is_cpu_backend(self.backend):
             model_kwargs["attn_implementation"] = "eager"
 
         with init_empty_weights():
@@ -163,7 +171,7 @@ class CodeGEMMForCausalLM(nn.Module):
 
         self.tie_weights()
 
-        if self.backend == "cpu":
+        if is_cpu_backend(self.backend):
             device_map = {"": "cpu"}
         else:
             device_map = {
@@ -216,6 +224,9 @@ class CodeGEMMForCausalLM(nn.Module):
             new_vocab_size=None,
             backend="cuda",
     ):
+        # Reject an unavailable ISA before reading or allocating a checkpoint.
+        backend = canonical_backend(backend)
+        validate_backend_platform(backend)
         config = cls._load_config(quant_model_path, trust_remote_code)
 
         codegemm_model = cls(

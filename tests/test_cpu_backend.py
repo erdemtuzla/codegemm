@@ -1,5 +1,7 @@
 import io
+import importlib.util
 import os
+import platform
 import subprocess
 import sys
 from unittest.mock import patch
@@ -10,9 +12,22 @@ import torch
 from codegemm.inference.codegemm_linear import CodeGEMMLinear
 
 
-def make_case(bias=False, out_features=7):
+# Run the same independent numerical checks against every installed variant.
+# NEON instructions cannot execute on the x86 WSL host, so those cases are
+# explicitly skipped there instead of being replaced by a scalar fallback.
+@pytest.fixture(params=("cpu-1", "cpu-2", "cpu-3", "cpu-4"))
+def cpu_backend(request):
+    backend = request.param
+    if backend != "cpu-1":
+        if platform.machine().lower() not in ("aarch64", "arm64"):
+            pytest.skip("NEON CPU variants require a 64-bit ARM machine")
+        if importlib.util.find_spec(f"codegemm_cpu_kernel_{backend[-1]}") is None:
+            pytest.skip(f"Build the optional {backend} extension to run this case")
+    return backend
+
+
+def make_case(bias=False, out_features=7, backend="cpu", in_features=256):
     generator = torch.Generator(device="cpu").manual_seed(19)
-    in_features = 256
 
     layer = CodeGEMMLinear(
         in_features=in_features,
@@ -22,7 +37,7 @@ def make_case(bias=False, out_features=7):
         num_codebooks=2,
         nbits_per_codebook=8,
         bias=bias,
-        backend="cpu",
+        backend=backend,
     )
 
     indices = torch.randint(
@@ -48,12 +63,20 @@ def make_case(bias=False, out_features=7):
         ) * 0.1
     )
 
-    # Distinct scales across both input groups and output rows.
+    # Distinct scales across input groups and output rows detect incorrect
+    # group boundaries. The default width still exercises exactly two groups.
     layer.scales.copy_(
         torch.stack(
             [
-                torch.linspace(0.1, 0.5, out_features),
-                torch.linspace(1.0, 2.0, out_features),
+                # Keep scale magnitudes bounded as width increases. Otherwise
+                # this fixture itself amplifies ordinary FP32 cancellation
+                # errors merely by adding more input groups.
+                torch.linspace(
+                    0.1 + 0.9 * group / max(1, in_features // 128 - 1),
+                    0.5 + 1.5 * group / max(1, in_features // 128 - 1),
+                    out_features,
+                )
+                for group in range(in_features // 128)
             ]
         )
     )
@@ -114,8 +137,8 @@ def expected_output(layer, indices, x):
         (2, 3, 256),
     ],
 )
-def test_lookup_and_prefill(shape, bias):
-    layer, indices = make_case(bias=bias)
+def test_lookup_and_prefill(shape, bias, cpu_backend):
+    layer, indices = make_case(bias=bias, backend=cpu_backend)
     generator = torch.Generator(device="cpu").manual_seed(29)
     x = torch.randn(shape, generator=generator)
 
@@ -130,8 +153,8 @@ def test_lookup_and_prefill(shape, bias):
     )
 
 
-def test_noncontiguous_input_and_multiple_output_blocks():
-    layer, indices = make_case(bias=True, out_features=131)
+def test_noncontiguous_input_and_multiple_output_blocks(cpu_backend):
+    layer, indices = make_case(bias=True, out_features=131, backend=cpu_backend)
     x = torch.arange(
         2 * 256 * 3,
         dtype=torch.float32,
@@ -147,8 +170,8 @@ def test_noncontiguous_input_and_multiple_output_blocks():
     )
 
 
-def test_repeated_calls_do_not_reuse_accumulated_output():
-    layer, indices = make_case(bias=True)
+def test_repeated_calls_do_not_reuse_accumulated_output(cpu_backend):
+    layer, indices = make_case(bias=True, backend=cpu_backend)
     first_input = torch.ones(1, 1, 256)
     second_input = torch.full((1, 1, 256), 0.25)
 
@@ -169,8 +192,8 @@ def test_repeated_calls_do_not_reuse_accumulated_output():
     )
 
 
-def test_checkpoint_keys_and_saved_values():
-    layer, _ = make_case(bias=True)
+def test_checkpoint_keys_and_saved_values(cpu_backend):
+    layer, _ = make_case(bias=True, backend=cpu_backend)
 
     assert set(layer.state_dict()) == {
         "codes", "codebooks", "scales", "bias"
@@ -190,7 +213,7 @@ def test_checkpoint_keys_and_saved_values():
     torch.save(saved, stream)
     stream.seek(0)
 
-    restored, _ = make_case(bias=True)
+    restored, _ = make_case(bias=True, backend=cpu_backend)
     restored.load_state_dict(
         torch.load(stream, weights_only=True),
         strict=True,
@@ -231,8 +254,8 @@ def test_unsupported_configuration(change):
         CodeGEMMLinear(**arguments)
 
 
-def test_invalid_scale_shape_is_rejected():
-    layer, _ = make_case()
+def test_invalid_scale_shape_is_rejected(cpu_backend):
+    layer, _ = make_case(backend=cpu_backend)
     layer.scales = layer.scales[:1].contiguous()
 
     with pytest.raises(RuntimeError, match="scales"):
@@ -282,7 +305,7 @@ torch.testing.assert_close(layer(x), expected)
     not os.environ.get("CODEGEMM_CPU_CHECKPOINT"),
     reason="Set CODEGEMM_CPU_CHECKPOINT to test a real checkpoint",
 )
-def test_real_checkpoint_prefill_and_generation():
+def test_real_checkpoint_prefill_and_generation(cpu_backend):
     from codegemm.inference.codegemm_causallm import (
         CodeGEMMForCausalLM,
     )
@@ -296,7 +319,7 @@ def test_real_checkpoint_prefill_and_generation():
     ):
         model = CodeGEMMForCausalLM.from_quantized(
             os.environ["CODEGEMM_CPU_CHECKPOINT"],
-            backend="cpu",
+            backend=cpu_backend,
         ).eval()
 
         for tensor in list(model.parameters()) + list(model.buffers()):
@@ -336,3 +359,60 @@ def test_real_checkpoint_prefill_and_generation():
         assert output.shape == (1, 5)
         assert any(count > 1 for count in seen_vector_counts)
         assert 1 in seen_vector_counts
+
+
+@pytest.mark.parametrize("width", (128, 768, 3072))
+@pytest.mark.parametrize("rows", (1, 3, 4, 5, 131))
+def test_realistic_widths_and_simd_row_tails(cpu_backend, width, rows):
+    # NEON can handle four values at a time, but output widths need not be
+    # multiples of four. Test both complete SIMD groups and scalar tails.
+    layer, indices = make_case(
+        bias=True, out_features=rows, backend=cpu_backend, in_features=width
+    )
+    generator = torch.Generator(device="cpu").manual_seed(31)
+    for shape in ((1, 1, width), (1, 2, width)):
+        inputs = torch.randn(shape, generator=generator)
+        torch.testing.assert_close(
+            layer(inputs), expected_output(layer, indices, inputs),
+            rtol=2e-5, atol=2e-5,
+        )
+
+
+def test_cpu_alias_preserves_checkpoint_layout():
+    # The original spelling remains usable with existing scripts. Both names
+    # select the scalar baseline and serialize precisely the same tensors.
+    original, indices = make_case(backend="cpu", bias=True)
+    numbered, _ = make_case(backend="cpu-1", bias=True)
+    numbered.load_state_dict(original.state_dict(), strict=True)
+    inputs = torch.ones(1, 1, original.in_features)
+    torch.testing.assert_close(numbered(inputs), original(inputs), rtol=0, atol=0)
+    assert original.backend == numbered.backend == "cpu-1"
+
+
+def test_numbered_neon_backends_reject_non_arm_hosts():
+    if platform.machine().lower() in ("aarch64", "arm64"):
+        pytest.skip("This rejection is specific to non-ARM hosts")
+    for backend in ("cpu-2", "cpu-3", "cpu-4"):
+        with pytest.raises((ValueError, RuntimeError), match="ARM|AArch64|aarch64|NEON"):
+            make_case(backend=backend)
+
+
+def test_threaded_variants_are_stable_across_worker_counts(cpu_backend):
+    if cpu_backend not in ("cpu-3", "cpu-4"):
+        pytest.skip("Only variants 3 and 4 have parallel custom loops")
+    layer, indices = make_case(bias=True, out_features=131, backend=cpu_backend)
+    inputs = torch.linspace(-1, 1, layer.in_features).reshape(1, 1, -1)
+    expected = expected_output(layer, indices, inputs)
+    previous_threads = torch.get_num_threads()
+    results = []
+    try:
+        # A request of eight must still keep custom-kernel workers within the
+        # four-worker Pi limit, while giving the same independent row results.
+        for count in (1, 2, 4, 8):
+            torch.set_num_threads(count)
+            results.append(layer(inputs))
+            torch.testing.assert_close(results[-1], expected, rtol=2e-5, atol=2e-5)
+    finally:
+        torch.set_num_threads(previous_threads)
+    for result in results[1:]:
+        torch.testing.assert_close(result, results[0], rtol=0, atol=0)

@@ -8,6 +8,11 @@ from typing import Optional
 import torch
 import torch.nn as nn
 from codegemm.inference.plugin import *
+from codegemm.inference.cpu_backends import (
+    canonical_backend,
+    is_cpu_backend,
+    validate_backend_platform,
+)
 
 
 def get_int_dtype(nbits: int) -> torch.dtype:
@@ -37,12 +42,12 @@ class CodeGEMMLinear(nn.Module):
     ):
         super().__init__()
 
-        if backend not in ("cuda", "cpu"):
-            raise ValueError(f"Unknown CodeGEMM backend: {backend!r}")
+        # Store a runtime implementation name without adding checkpoint fields.
+        # The old name "cpu" remains an alias for the first implementation.
+        self.backend = canonical_backend(backend)
+        validate_backend_platform(self.backend)
 
-        self.backend = backend
-
-        if backend == "cpu":
+        if is_cpu_backend(self.backend):
             from codegemm.inference.cpu_ops import validate_config
 
             validate_config(
@@ -131,7 +136,7 @@ class CodeGEMMLinear(nn.Module):
         x : (B, T, in_features)
         """
 
-        if self.backend == "cpu":
+        if is_cpu_backend(self.backend):
             from codegemm.inference.cpu_ops import linear
 
             return linear(
@@ -141,6 +146,7 @@ class CodeGEMMLinear(nn.Module):
                 self.codebooks,
                 self.group_size,
                 self.bias,
+                backend=self.backend,
             )
         
         if x.numel() // self.in_features == 1:

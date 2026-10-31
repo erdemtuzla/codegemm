@@ -152,3 +152,5 @@ finetuned/
 redpajama_tokenized_llama3_8192/
 packed_hf/
 hf_models/
+
+*.arrow

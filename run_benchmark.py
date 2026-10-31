@@ -342,12 +342,19 @@ def quality(model, ids, chunk_size, max_chunks, device):
 
 
 def metadata(repo, checkpoint, device, args, cache_paths):
+    from codegemm.inference.cpu_backends import cpu_extension_name
+    from codegemm.inference.cpu_ops import cpu_backend_info
+
     packages = {}
     for name in ("torch", "transformers", "accelerate", "psutil", "safetensors"):
         packages[name] = importlib.metadata.version(name)
     extension = importlib.util.find_spec(
-        "codegemm_cpu_kernel" if device.type == "cpu" else "codegemm_kernel"
+        cpu_extension_name(args.backend) if device.type == "cpu" else "codegemm_kernel"
     )
+    # Label the binary actually loaded, rather than infer its optimization level
+    # from a CLI name. This catches stale pre-experiment extension installations.
+    cpu_build = cpu_backend_info(args.backend) if device.type == "cpu" else None
+    kernel_dir = repo / "codegemm/inference/cpu_kernel"
     artifacts = sorted(
         path for path in checkpoint.rglob("*")
         if path.is_file() and path.suffix in (".json", ".safetensors", ".bin", ".model")
@@ -371,6 +378,14 @@ def metadata(repo, checkpoint, device, args, cache_paths):
         },
         "token_cache_sha256": {name: sha256(path) for name, path in cache_paths.items()},
         "extension_sha256": sha256(extension.origin) if extension else None,
+        "cpu_backend_build": cpu_build,
+        "custom_kernel_thread_limit": min(torch.get_num_threads(), cpu_build["max_threads"]) if cpu_build else None,
+        "kernel_source_sha256": {
+            str(path.relative_to(repo)): sha256(path)
+            for path in sorted(kernel_dir.rglob("*"))
+            if path.is_file() and path.suffix in (".cpp", ".h", ".hpp", ".py")
+            and not any(part in ("build", "__pycache__") for part in path.relative_to(kernel_dir).parts)
+        },
         "backend": args.backend,
         "device": str(device),
         "gpu": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
@@ -390,11 +405,29 @@ def metadata(repo, checkpoint, device, args, cache_paths):
 
 
 def main():
+    # Bootstrap the repository path before importing shared backend rules. This
+    # keeps the standalone --repo option usable even when the script is elsewhere.
+    bootstrap = argparse.ArgumentParser(add_help=False)
+    bootstrap.add_argument("--repo", default=".")
+    bootstrap_args, _ = bootstrap.parse_known_args()
+    repo = Path(bootstrap_args.repo).resolve()
+    if not (repo / "codegemm").is_dir():
+        bootstrap.error("repo must contain the codegemm package directory")
+    sys.path.insert(0, str(repo))
+    from codegemm.inference.cpu_backends import (
+        BACKEND_CHOICES,
+        backend_device_type,
+        canonical_backend,
+        is_cpu_backend,
+        resolve_cpu_threads,
+        validate_backend_platform,
+    )
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", default=".", help="CodeGEMM repository root")
     parser.add_argument("--model-path", required=True, help="Local packed checkpoint")
-    parser.add_argument("--backend", choices=("cpu", "cuda"), default="cpu")
-    parser.add_argument("--device", help="Defaults to backend; CUDA may use cuda:0")
+    parser.add_argument("--backend", choices=BACKEND_CHOICES, default="cpu")
+    parser.add_argument("--device", help="Defaults to cpu for any CPU backend; CUDA may use cuda:0")
     parser.add_argument("--mode", choices=("quality", "latency", "memory", "all"), default="all")
     parser.add_argument("--datasets", default="wikitext2-llama68m-cpucheck-v1,c4-new-llama68m-cpucheck-v1")
     parser.add_argument("--tokenizer-type", default="llama", help="Prefix used in existing cache filenames")
@@ -403,7 +436,8 @@ def main():
     parser.add_argument("--new-tokens", type=int, default=64)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=10)
-    parser.add_argument("--threads", type=int, default=1)
+    parser.add_argument("--threads", type=int, default=None,
+                        help="Auto: 1 for cpu-1/2 and CUDA, at most 4 for cpu-3/4")
     parser.add_argument("--chunk-size", type=int, default=2048)
     parser.add_argument("--ppl-max-chunks", type=int, default=0, help="0 evaluates all complete cached chunks; positive limits are smoke tests")
     parser.add_argument("--sample-ms", type=float, default=20)
@@ -412,7 +446,7 @@ def main():
     parser.add_argument("--perf-phase", choices=("prefill", "decode", "request"), default="decode")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
-    if min(args.repeats, args.threads) < 1 or args.warmup < 0:
+    if args.repeats < 1 or (args.threads is not None and args.threads < 1) or args.warmup < 0:
         parser.error("Use positive repeats/threads and nonnegative warmup")
     if args.new_tokens < 2 or args.chunk_size < 2 or args.ppl_max_chunks < 0 or args.sample_ms <= 0:
         parser.error("Require new-tokens >= 2, chunk-size >= 2, nonnegative ppl-max-chunks and positive sample-ms")
@@ -425,12 +459,19 @@ def main():
     datasets = [value.strip() for value in args.datasets.split(",") if value.strip()]
     if not datasets:
         parser.error("Provide at least one dataset cache name")
-    device = torch.device(args.device or args.backend)
-    if device.type != args.backend:
+    args.requested_backend = args.backend
+    args.backend = canonical_backend(args.backend)
+    try:
+        validate_backend_platform(args.backend)
+    except RuntimeError as exc:
+        parser.error(str(exc))
+    device_type = backend_device_type(args.backend)
+    device = torch.device(args.device or device_type)
+    if device.type != device_type:
         parser.error("device type must match backend")
     if bool(args.perf_control) != bool(args.perf_ack):
         parser.error("Provide perf-control and perf-ack together")
-    if args.perf_control and (args.mode != "latency" or args.backend != "cpu" or len(lengths) != 1):
+    if args.perf_control and (args.mode != "latency" or not is_cpu_backend(args.backend) or len(lengths) != 1):
         parser.error("perf control requires CPU latency mode and exactly one prompt length")
     output_path = Path(args.output).resolve()
     if output_path.suffix != ".json":
@@ -457,7 +498,11 @@ def main():
     for path in cache_paths.values():
         if not path.is_file():
             parser.error(f"Missing frozen token cache (no download is attempted): {path}")
-    torch.set_num_threads(args.threads)
+    # Configure the framework pool explicitly in this process. The serial
+    # variants default to one thread; threaded variants use no more than four.
+    # PyTorch matrix multiplication remains optimized under every backend.
+    threads = resolve_cpu_threads(args.backend, args.threads) if is_cpu_backend(args.backend) else args.threads or 1
+    torch.set_num_threads(threads)
     torch.set_num_interop_threads(1)
     torch.random.default_generator.manual_seed(0)
     if device.type == "cuda":

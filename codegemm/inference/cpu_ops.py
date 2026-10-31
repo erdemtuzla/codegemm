@@ -2,8 +2,16 @@ import importlib
 
 import torch
 
+from codegemm.inference.cpu_backends import (
+    canonical_backend,
+    cpu_extension_name,
+    validate_backend_platform,
+)
 
-_CPU_EXTENSION = None
+
+# Each backend has its own binary and compiler flags. Cache by canonical name
+# so selecting cpu-4 can never accidentally reuse the cpu-1 module.
+_CPU_EXTENSIONS = {}
 _OUTPUT_ROWS_PER_BLOCK = 128
 
 
@@ -37,25 +45,39 @@ def validate_config(
         raise ValueError("CPU output features must be positive.")
 
 
-def _cpu_extension():
-    global _CPU_EXTENSION
-
-    if _CPU_EXTENSION is None:
+def _cpu_extension(backend="cpu"):
+    backend = canonical_backend(backend)
+    validate_backend_platform(backend)
+    if backend not in _CPU_EXTENSIONS:
+        name = cpu_extension_name(backend)
         try:
-            _CPU_EXTENSION = importlib.import_module(
-                "codegemm_cpu_kernel"
-            )
+            extension = importlib.import_module(name)
         except (ImportError, OSError) as exc:
             raise RuntimeError(
-                "The CPU backend requires codegemm_cpu_kernel. "
-                "Build codegemm/inference/cpu_kernel first."
+                f"{backend} requires {name}. Build the requested variant in "
+                "codegemm/inference/cpu_kernel first."
             ) from exc
+        # An older installation used -O2 for the baseline. Refuse an unlabelled
+        # binary rather than report it as the new, deliberately unoptimized one.
+        if not hasattr(extension, "build_info"):
+            raise RuntimeError(
+                f"{name} is an older build without variant metadata. Rebuild "
+                "codegemm/inference/cpu_kernel before running CPU variants."
+            )
+        info = extension.build_info()
+        if info.get("backend") != backend:
+            raise RuntimeError(f"Requested {backend}, but {name} reports {info!r}; rebuild the extension")
+        _CPU_EXTENSIONS[backend] = extension
+    return _CPU_EXTENSIONS[backend]
 
-    return _CPU_EXTENSION
+
+def cpu_backend_info(backend="cpu"):
+    """Expose the actual compiled configuration to benchmark reports."""
+    return dict(_cpu_extension(backend).build_info())
 
 
 @torch.no_grad()
-def linear(x, codes, scales, codebooks, group_size, bias=None):
+def linear(x, codes, scales, codebooks, group_size, bias=None, *, backend="cpu"):
     if x.device.type != "cpu" or x.dtype != torch.float32:
         raise ValueError("CPU activations must be CPU float32 tensors.")
 
@@ -84,7 +106,9 @@ def linear(x, codes, scales, codebooks, group_size, bias=None):
                 "CPU bias must be a float32 tensor with shape [M]."
             )
 
-    extension = _cpu_extension()
+    # Keep the existing tensor layouts and algorithm dispatch; only the chosen
+    # C++ implementation changes between the four experiments.
+    extension = _cpu_extension(backend)
 
     # These calls do not copy already-contiguous tensors.
     codes = codes.contiguous()

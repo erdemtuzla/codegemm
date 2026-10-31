@@ -1,8 +1,17 @@
 import os
 import json
 import argparse
+import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from codegemm.inference.codegemm_causallm import CodeGEMMForCausalLM
+from codegemm.inference.cpu_backends import (
+    BACKEND_CHOICES,
+    backend_device_type,
+    canonical_backend,
+    is_cpu_backend,
+    resolve_cpu_threads,
+    validate_backend_platform,
+)
 from codegemm.evaluate import eval
 from codegemm.utils.run_logging import setup_run_log
 
@@ -55,11 +64,28 @@ parser.add_argument('--log_dir', type=str, default='history',
                     help='Directory for timestamped run logs. Default: history')
 parser.add_argument(
     "--codegemm-backend",
-    choices=("cuda", "cpu"),
+    "--backend",
+    choices=BACKEND_CHOICES,
     default="cuda",
     help="Backend used by compressed CodeGEMM linear layers.",
 )
+parser.add_argument(
+    "--cpu-threads", type=int, default=None,
+    help="Framework CPU threads: auto 1 for cpu-1/2, at most 4 for cpu-3/4.",
+)
 args = parser.parse_args()
+
+# A CPU variant is an algorithm name, not a torch.device string. Only CLI
+# entrypoints select global framework thread counts; model constructors do not.
+args.codegemm_backend = canonical_backend(args.codegemm_backend)
+try:
+    validate_backend_platform(args.codegemm_backend)
+    if is_cpu_backend(args.codegemm_backend):
+        torch.set_num_threads(resolve_cpu_threads(args.codegemm_backend, args.cpu_threads))
+    elif args.cpu_threads is not None:
+        parser.error("--cpu-threads applies only to CPU backends")
+except (ValueError, RuntimeError) as exc:
+    parser.error(str(exc))
 
 log_path = setup_run_log("run_eval", args.log_dir, args.model_path)
 print(STARTUP_MESSAGE)
@@ -179,7 +205,7 @@ for i, model_path in enumerate(total_tests_to_run):
     model = CodeGEMMForCausalLM.from_quantized(
         model_path,
         backend=args.codegemm_backend,
-    ).to(args.codegemm_backend).eval()
+    ).to(backend_device_type(args.codegemm_backend)).eval()
     
     tokenizer_type = get_tokenizer_type(model_path)
 

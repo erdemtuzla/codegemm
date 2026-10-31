@@ -1,10 +1,24 @@
+// CPU inference kernels for m=2, b=8, v=8, g=128 checkpoints.
+// Computation uses FP32 while preserving the existing packed-code layout.
+// Single-vector inference uses Psumbook lookup; multiple-vector inference
+// reconstructs temporary weight blocks through dequantize_block()
+// This is a scalar C++ baseline without explicit NEON or threading.
+
 #include <torch/extension.h>
 
 #include <array>
 #include <cstdint>
 
+// Keep this file as cpu-1's original scalar algorithm. Build metadata lets
+// Python distinguish the new -O0 binary from the previously installed -O2 one.
+#include "build_info.h"
+
 using torch::Tensor;
 
+// K: input width
+// M: output width
+// Each centroid describes 8 input features. Four 8-bit centroid indices
+// fit in one int32 word, so each packed position covers 32 input features
 struct Shape {
     int64_t K; // Number of input features
     int64_t M; // Number of output features
@@ -207,6 +221,7 @@ Tensor dequantize_block(
 
 // Makes the two C++ functions callable from Python
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+    module.def("build_info", &codegemm_cpu::build_info);
     module.def(
         "gemv",
         &gemv,

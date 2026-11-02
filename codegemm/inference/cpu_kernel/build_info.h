@@ -9,6 +9,14 @@
 #error "Build CPU extensions using the provided setup.py so flags are recorded."
 #endif
 
+#ifndef CODEGEMM_CPU_SCALAR_MT
+#define CODEGEMM_CPU_SCALAR_MT 0
+#endif
+
+#if CODEGEMM_CPU_SCALAR_MT && CODEGEMM_CPU_VARIANT != 1
+#error "cpu-1-mt must retain the scalar cpu-1 arithmetic and -O0 build settings."
+#endif
+
 // setuptools may supply -O3 earlier in a compile command. setup.py puts its
 // -O0 last; this compile-time check makes accidental optimized baselines fail.
 #if CODEGEMM_CPU_VARIANT < 4 && defined(__OPTIMIZE__)
@@ -30,9 +38,11 @@ namespace codegemm_cpu {
 inline pybind11::dict build_info() {
     pybind11::dict info;
     constexpr bool neon = CODEGEMM_CPU_VARIANT > 1;
-    constexpr bool threaded = CODEGEMM_CPU_VARIANT >= 3;
+    constexpr bool threaded = CODEGEMM_CPU_VARIANT >= 3 || CODEGEMM_CPU_SCALAR_MT;
     constexpr bool optimized = CODEGEMM_CPU_VARIANT == 4;
-    info["backend"] = std::string("cpu-") + std::to_string(CODEGEMM_CPU_VARIANT);
+    info["backend"] = CODEGEMM_CPU_SCALAR_MT
+        ? std::string("cpu-1-mt")
+        : std::string("cpu-") + std::to_string(CODEGEMM_CPU_VARIANT);
     info["neon"] = neon;
     info["threaded"] = threaded;
     info["multithreaded"] = threaded;

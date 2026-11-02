@@ -4,15 +4,11 @@
 #pragma once
 
 #include <torch/extension.h>
-#include <ATen/Parallel.h>
-
-#include <algorithm>
 #include <array>
-#include <atomic>
 #include <cstdint>
-#include <exception>
 
 #include "build_info.h"
+#include "cpu_parallel.h"
 #include "neon_math.h"
 
 #if CODEGEMM_CPU_VARIANT < 2 || CODEGEMM_CPU_VARIANT > 4
@@ -23,6 +19,7 @@ namespace {
 
 using torch::Tensor;
 using codegemm_cpu_neon::Shape;
+using codegemm_cpu::for_chunks;
 
 // Reject device, dtype, and storage mismatches before taking raw pointers.
 // These checks are deliberately inside the C++ boundary as Python callers can
@@ -56,59 +53,6 @@ Shape validate(
     TORCH_CHECK(scales.dim() == 2 && scales.size(0) == K / 128 &&
                 scales.size(1) == M, "scales must have shape [K/128, M]");
     return {K, M, P};
-}
-
-// Reuse PyTorch's parallel runtime rather than creating std::threads per layer.
-// Restrict active work to the Pi 5's four CPU cores; a lower PyTorch thread
-// setting is respected. No Tensor operations appear in worker callbacks, so
-// no tensor/autograd thread-local state needs to be copied into these workers.
-template <class Function>
-void for_chunks(int64_t count, const Function& function) {
-#if CODEGEMM_CPU_VARIANT >= 3
-    const int64_t workers = std::min<int64_t>({4, at::get_num_threads(), count});
-#if AT_PARALLEL_OPENMP && defined(_OPENMP)
-    // ATen's OpenMP parallel_for creates a full globally configured team even
-    // when its work range contains only four chunks. Request a team of at
-    // most four here instead, using the same OpenMP runtime as PyTorch.
-    // This also keeps the Python API capped when callers configured >4 threads.
-    if (workers > 1 && !at::in_parallel_region() && !omp_in_parallel()) {
-        std::exception_ptr error;
-        std::atomic_flag caught = ATOMIC_FLAG_INIT;
-#pragma omp parallel num_threads(workers)
-        {
-            // OMP_DYNAMIC may supply fewer threads than requested. Partition
-            // by the actual team size so every element is still processed.
-            const int64_t team = omp_get_num_threads();
-            const int64_t worker = omp_get_thread_num();
-            try {
-                function(count * worker / team, count * (worker + 1) / team);
-            } catch (...) {
-                // Exceptions cannot unwind across an OpenMP region. Retain
-                // the first one and rethrow after the implicit join barrier.
-                if (!caught.test_and_set(std::memory_order_relaxed)) {
-                    error = std::current_exception();
-                }
-            }
-        }
-        if (error) {
-            std::rethrow_exception(error);
-        }
-        return;
-    }
-#else
-    // A native-thread-pool PyTorch build already owns its worker threads.
-    // Schedule at most four disjoint chunks through that existing pool.
-    if (workers > 1) {
-        at::parallel_for(0, workers, 1, [&](int64_t begin, int64_t end) {
-            for (int64_t worker = begin; worker < end; ++worker) {
-                function(count * worker / workers, count * (worker + 1) / workers);
-            }
-        });
-        return;
-    }
-#endif
-#endif
-    function(0, count);
 }
 
 Tensor gemv(

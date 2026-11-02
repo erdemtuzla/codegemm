@@ -107,7 +107,7 @@ def linear(x, codes, scales, codebooks, group_size, bias=None, *, backend="cpu")
             )
 
     # Keep the existing tensor layouts and algorithm dispatch; only the chosen
-    # C++ implementation changes between the four experiments.
+    # C++ implementation changes between the CPU experiments.
     extension = _cpu_extension(backend)
 
     # These calls do not copy already-contiguous tensors.

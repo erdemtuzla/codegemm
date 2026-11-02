@@ -437,7 +437,7 @@ def main():
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=10)
     parser.add_argument("--threads", type=int, default=None,
-                        help="Auto: 1 for cpu-1/2 and CUDA, at most 4 for cpu-3/4")
+                        help="Auto: 1 for cpu-1/2 and CUDA, at most 4 for cpu-1-mt/3/4")
     parser.add_argument("--chunk-size", type=int, default=2048)
     parser.add_argument("--ppl-max-chunks", type=int, default=0, help="0 evaluates all complete cached chunks; positive limits are smoke tests")
     parser.add_argument("--sample-ms", type=float, default=20)

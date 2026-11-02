@@ -1,14 +1,15 @@
-# Four cumulative CPU implementations
+# CPU implementations and the scalar multithreaded control
 
 These backends run the same packed checkpoint with different CPU kernels. They
 do not change quantization, retrain weights, or change checkpoint tensor layouts.
-All four currently support `m=2, b=8, v=8, g=128`, with a positive input width
+All variants currently support `m=2, b=8, v=8, g=128`, with a positive input width
 divisible by 128 and a positive output width. CPU floating-point computation is
 FP32. The existing CUDA implementation is retained.
 
 | Backend | Custom computation | Custom-kernel compiler optimization | Custom-kernel threads | Where it runs |
 | --- | --- | --- | --- | --- |
 | `cpu-1` | Scalar C++ | Disabled with `-O0`; automatic vectorization disabled | One | x86-64 WSL and 64-bit ARM |
+| `cpu-1-mt` | Scalar C++ with parallel work | Disabled with `-O0`; automatic vectorization disabled | Up to four | x86-64 WSL and 64-bit ARM |
 | `cpu-2` | Explicit ARM NEON | Disabled with `-O0`; automatic vectorization disabled | One | AArch64 ARM |
 | `cpu-3` | The NEON implementation with parallel work | Disabled with `-O0`; automatic vectorization disabled | Up to four | AArch64 ARM |
 | `cpu-4` | The same threaded NEON implementation | Enabled with `-O3` | Up to four | AArch64 ARM |
@@ -37,7 +38,7 @@ call; the saved codebooks and their learned values are unchanged. NEON also
 accelerates reconstruction of the eight-element centroid vectors used during
 prompt processing.
 
-`cpu-3` and `cpu-4` share work through the OpenMP runtime used by PyTorch, or
+`cpu-1-mt`, `cpu-3`, and `cpu-4` share work through the OpenMP runtime used by PyTorch, or
 through PyTorch's native thread pool when that is the installed parallel backend.
 They split independent Psumbook entries and output rows across workers. Each
 output row has a single owner while it is being computed, avoiding races and
@@ -56,6 +57,48 @@ The implementation uses bounded scratch space and reconstructs at most 128
 output rows at a time for multiple-vector inputs. It does not keep a dense FP32
 copy of every compressed layer.
 
+## Compare scalar multithreading with NEON multithreading
+
+`cpu-1-mt` is an additional control, not a replacement for `cpu-1`. It retains
+the scalar codebook dot products, packed-index decoding, scale boundaries and
+per-row accumulation order of `cpu-1`. It parallelizes the same two stages as
+`cpu-3`: 32 independent Psumbook tables followed by independent output rows.
+Prompt weight reconstruction is also split by output row. Both implementations
+call the same scheduling helper in `cpu_parallel.h`, which supplies the same
+barriers, nested-region handling and four-worker limit.
+
+Compare `cpu-1-mt --threads 4` with `cpu-3 --threads 4` on the same Pi. Both use
+`-O0`, disable automatic vectorization and FMA contraction, and use four threads
+for eligible framework operations as well as the custom kernels. Comparing to
+`cpu-4` instead would also introduce compiler optimization into the experiment.
+
+This comparison measures the NEON implementation as a whole, including its
+temporary codebook transpose, SIMD lookup strategy and explicit fused arithmetic.
+It is not a single-instruction microbenchmark. `cpu-1-mt` keeps `cpu-1`'s original
+codebook layout and does not add the transpose or NEON FMA. The underlying
+Psumbook algorithm and checkpoint remain the same. PyTorch itself remains an
+optimized library and may use SIMD in every backend, including scalar ones.
+
+For a quick generation-only comparison, after defining `PACKED_PATH` and
+`WT_CASE`, run this on Pi:
+
+```bash
+for backend in cpu-1-mt cpu-3; do
+    OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 \
+    python run_benchmark.py \
+        --model-path "$PACKED_PATH" \
+        --backend "$backend" --threads 4 \
+        --mode latency --datasets "$WT_CASE" \
+        --prompt-lengths 128,512 --new-tokens 64 \
+        --warmup 2 --repeats 3 \
+        --output "benchmarks/${backend}_neon_comparison.json" \
+        || break
+done
+```
+
+Use distinct output filenames when repeating. The same `--backend cpu-1-mt`
+works with `profile_cpu.sh`, `run_eval.py`, `run_generate.py`, and the Python API.
+
 ## Build the extensions
 
 Activate the existing CodeGEMM conda environment and start in the repository root:
@@ -64,8 +107,8 @@ Activate the existing CodeGEMM conda environment and start in the repository roo
 conda activate codegemm
 ```
 
-On an x86-64 WSL machine, the default build produces `cpu-1`. On a 64-bit ARM
-machine, the default build produces all four variants:
+On an x86-64 WSL machine, the default build produces `cpu-1` and `cpu-1-mt`.
+On a 64-bit ARM machine, the default build produces all five variants:
 
 ```bash
 (
@@ -85,7 +128,7 @@ To select the variants included in a build, set `CODEGEMM_CPU_VARIANTS`:
 ```bash
 (
     cd codegemm/inference/cpu_kernel
-    CODEGEMM_CPU_VARIANTS=cpu-1,cpu-2,cpu-3,cpu-4 MAX_JOBS=1 \
+    CODEGEMM_CPU_VARIANTS=cpu-1,cpu-1-mt,cpu-2,cpu-3,cpu-4 MAX_JOBS=1 \
       python -m pip install --force-reinstall --no-build-isolation --no-deps .
 )
 ```
@@ -93,7 +136,9 @@ To select the variants included in a build, set `CODEGEMM_CPU_VARIANTS`:
 That example requires AArch64. Selecting `cpu-2`, `cpu-3`, or `cpu-4` on x86-64
 fails clearly; it does not silently replace NEON with scalar code. Building a
 selected subset installs that subset of the extension package. Use the default
-ARM build when you want all four variants available together.
+ARM build when you want all five variants available together. Installing only
+`cpu-1-mt` with `--force-reinstall` replaces the extension distribution with that
+subset; include all five names to retain the original modules alongside it.
 
 Check the native modules on the Pi after installing:
 
@@ -104,6 +149,7 @@ import torch  # Load PyTorch's shared libraries before importing C++ extensions.
 
 modules = {
     "cpu-1": "codegemm_cpu_kernel",
+    "cpu-1-mt": "codegemm_cpu_kernel_1_mt",
     "cpu-2": "codegemm_cpu_kernel_2",
     "cpu-3": "codegemm_cpu_kernel_3",
     "cpu-4": "codegemm_cpu_kernel_4",
@@ -114,7 +160,7 @@ for backend, name in modules.items():
 PY
 ```
 
-On WSL, check just `codegemm_cpu_kernel`. The `build_info()` output identifies
+On WSL, check `codegemm_cpu_kernel` and `codegemm_cpu_kernel_1_mt`. The `build_info()` output identifies
 the backend, NEON support, threading support, and compiler optimization. A stale
 extension without this information must be rebuilt before comparing variants.
 
@@ -132,7 +178,7 @@ python run_eval.py --model_path "$PACKED_PATH" \
 
 `--codegemm-backend cpu-3` is equivalent to `--backend cpu-3`. CUDA remains the
 default in those existing entry points. Their CPU thread defaults are one for
-`cpu-1`/`cpu-2`, and up to four available CPUs for `cpu-3`/`cpu-4`.
+`cpu-1`/`cpu-2`, and up to four available CPUs for `cpu-1-mt`/`cpu-3`/`cpu-4`.
 
 For Python API use:
 
@@ -154,7 +200,7 @@ caller sets a higher PyTorch thread count. With OpenMP, the requested team itsel
 is capped at four. A native-thread-pool build uses up to four active tasks in
 PyTorch's existing pool. Other PyTorch operations can still use the caller's
 thread count. The benchmark and execution CLIs cap requested counts for
-`cpu-3`/`cpu-4` so their matrix multiplication and custom kernels use a consistent
+`cpu-1-mt`/`cpu-3`/`cpu-4` so their matrix multiplication and custom kernels use a consistent
 four-core budget.
 For clean `cpu-1` and `cpu-2` comparisons, explicitly use one thread. Increasing
 their PyTorch thread count accelerates eligible framework operations but does
@@ -184,10 +230,10 @@ model being tested. Adjust `PACKED_PATH` if your checkpoint is still under
 The following loop compares one-thread baselines with four-thread variants:
 
 ```bash
-for backend in cpu-1 cpu-2 cpu-3 cpu-4; do
+for backend in cpu-1 cpu-1-mt cpu-2 cpu-3 cpu-4; do
     case "$backend" in
         cpu-1|cpu-2) threads=1 ;;
-        cpu-3|cpu-4) threads=4 ;;
+        cpu-1-mt|cpu-3|cpu-4) threads=4 ;;
     esac
 
     OMP_NUM_THREADS="$threads" \
@@ -216,7 +262,7 @@ filename for another run.
 
 Additional useful controls are `cpu-3 --threads 1` and `cpu-4 --threads 1`.
 They show how the threaded implementation behaves with one worker. The main
-four-row experiment measures cumulative changes; the extra controls help isolate
+original four-variant experiment measures cumulative changes; the extra controls help isolate
 threading from compiler optimization. Keep prompt length, output length, warmup,
 repetition count, and input hashes fixed across comparisons.
 
@@ -259,9 +305,9 @@ reference, including high packed indices and distinct scale groups. The
 checkpoint test exercises prompt processing and cached generation. Native ARM
 tests are required for the NEON variants. The suite skips NEON cases if their
 modules are not installed, including on ARM. Check the skipped-test summary
-(`pytest -ra` shows the reasons) and the four `build_info()` results before
-treating a passing run as validation of all four variants. An x86-64 run
-validates the scalar baseline and dispatch/rejection behavior only.
+(`pytest -ra` shows the reasons) and the five `build_info()` results before
+treating a passing run as validation of all five variants. An x86-64 run
+validates both scalar implementations and dispatch/rejection behavior.
 Cross-compiling ARM code checks compilation and generated instructions; it does
 not validate native runtime behavior or Pi performance.
 

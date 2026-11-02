@@ -2,7 +2,7 @@
 
 The optimization flag belongs to each extension, not to a Python switch: a
 single binary cannot turn compiler optimization on and off after compilation.
-PyTorch itself remains its normal optimized build in all four experiments.
+PyTorch itself remains its normal optimized build in all experiments.
 """
 
 import os
@@ -19,7 +19,7 @@ HERE = Path(__file__).resolve().parent
 # direct invocation from the repository root behave like pip's build process.
 os.chdir(HERE)
 IS_AARCH64 = platform.machine().lower() in ("aarch64", "arm64")
-DEFAULT_VARIANTS = "1,2,3,4" if IS_AARCH64 else "1"
+DEFAULT_VARIANTS = "1,1-mt,2,3,4" if IS_AARCH64 else "1,1-mt"
 requested = os.environ.get("CODEGEMM_CPU_VARIANTS", DEFAULT_VARIANTS)
 
 # Selecting variants explicitly is useful on a Pi with limited build memory.
@@ -27,16 +27,15 @@ requested = os.environ.get("CODEGEMM_CPU_VARIANTS", DEFAULT_VARIANTS)
 variants = []
 for value in requested.split(","):
     value = value.strip().removeprefix("cpu-")
-    if value not in ("1", "2", "3", "4"):
-        raise RuntimeError("CODEGEMM_CPU_VARIANTS must list cpu-1 through cpu-4")
-    variant = int(value)
-    if variant not in variants:
-        variants.append(variant)
+    if value not in ("1", "1-mt", "2", "3", "4"):
+        raise RuntimeError("CODEGEMM_CPU_VARIANTS accepts cpu-1, cpu-1-mt, cpu-2, cpu-3, cpu-4")
+    if value not in variants:
+        variants.append(value)
 
-if any(variant > 1 for variant in variants) and not IS_AARCH64:
+if any(variant in ("2", "3", "4") for variant in variants) and not IS_AARCH64:
     raise RuntimeError(
         "cpu-2/cpu-3/cpu-4 contain ARM NEON instructions and require AArch64. "
-        "Build cpu-1 on this host; build the other variants on the 64-bit Pi."
+        "Build cpu-1/cpu-1-mt on this host; build the NEON variants on the 64-bit Pi."
     )
 
 parallel_info = torch.__config__.parallel_info()
@@ -47,11 +46,15 @@ if not uses_native:
     uses_native = "ATen parallel backend: native" in parallel_info
 
 extensions = []
-for variant in variants:
-    threaded = variant >= 3
+for selected in variants:
+    # cpu-1-mt keeps scalar variant 1's arithmetic/optimization identity, with
+    # an additional macro identifying its separate multithreaded module.
+    scalar_mt = selected == "1-mt"
+    variant = 1 if scalar_mt else int(selected)
+    threaded = scalar_mt or variant >= 3
     if threaded and not (uses_openmp or uses_native):
         raise RuntimeError(
-            "cpu-3/cpu-4 require an OpenMP or native-thread-pool PyTorch build. "
+            "Threaded CPU variants require an OpenMP or native-thread-pool PyTorch build. "
             "Refusing to build a backend that would silently execute serially."
         )
 
@@ -79,17 +82,22 @@ for variant in variants:
             flags.append("-fopenmp")
             link_flags.append("-fopenmp")
 
-    name = "codegemm_cpu_kernel" if variant == 1 else f"codegemm_cpu_kernel_{variant}"
+    name = "codegemm_cpu_kernel_1_mt" if scalar_mt else (
+        "codegemm_cpu_kernel" if variant == 1 else f"codegemm_cpu_kernel_{variant}"
+    )
+    source = "kernels_1_mt.cpp" if scalar_mt else (
+        "kernels.cpp" if variant == 1 else f"kernels_{variant}.cpp"
+    )
     extensions.append(
         CppExtension(
             name=name,
             # Give each binary its own object filename. This also remains safe
             # if setuptools builds several extensions concurrently.
-            sources=["kernels.cpp" if variant == 1 else f"kernels_{variant}.cpp"],
+            sources=[source],
             # Distutils, as well as Ninja, must notice header/flag changes.
             depends=["setup.py", "build_info.h"] + (
                 ["neon_bindings.h", "neon_math.h"] if variant > 1 else []
-            ),
+            ) + (["cpu_parallel.h"] if scalar_mt or variant > 1 else []),
             define_macros=[
                 ("CODEGEMM_CPU_VARIANT", str(variant)),
                 ("CODEGEMM_CPU_FLAGS", '"' + " ".join(flags) + '"'),
@@ -102,7 +110,7 @@ for variant in variants:
 
 setup(
     name="codegemm_cpu_kernel",
-    version="0.2.0",
+    version="0.3.0",
     ext_modules=extensions,
     cmdclass={"build_ext": BuildExtension},
 )

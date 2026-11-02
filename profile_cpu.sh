@@ -4,7 +4,9 @@
 # PERF_REPORT=benchmarks/pi_decode_perf.txt bash profile_cpu.sh \
 #   --model-path packed_hf/MODEL --prompt-lengths 512 --perf-phase decode \
 #   --output benchmarks/pi_decode_profile.json
-# Pass --backend cpu-1/cpu-2/cpu-3/cpu-4 to profile the chosen implementation.
+# Pass --backend cpu-1/cpu-1-mt/cpu-2/cpu-3/cpu-4 to choose an implementation.
+# Compare cpu-1-mt and cpu-3 with the same --threads setting to keep threading
+# fixed while evaluating the scalar and NEON implementations.
 # The default remains the compatible cpu alias; explicit arguments below take
 # precedence because run_benchmark.py receives them after these defaults.
 set -euo pipefail

@@ -99,7 +99,7 @@ def main():
     )
     parser.add_argument(
         "--cpu-threads", type=int, default=None,
-        help="Framework CPU threads: auto 1 for cpu-1/2, at most 4 for cpu-3/4.",
+        help="Framework CPU threads: auto 1 for cpu-1/2, at most 4 for cpu-1-mt/3/4.",
     )
     args = parser.parse_args()
 

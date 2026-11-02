@@ -10,18 +10,20 @@ import pytest
 import torch
 
 from codegemm.inference.codegemm_linear import CodeGEMMLinear
+from codegemm.inference.cpu_backends import CPU_BACKENDS, cpu_extension_name
 
 
 # Run the same independent numerical checks against every installed variant.
 # NEON instructions cannot execute on the x86 WSL host, so those cases are
 # explicitly skipped there instead of being replaced by a scalar fallback.
-@pytest.fixture(params=("cpu-1", "cpu-2", "cpu-3", "cpu-4"))
+@pytest.fixture(params=CPU_BACKENDS)
 def cpu_backend(request):
     backend = request.param
-    if backend != "cpu-1":
+    if backend in ("cpu-2", "cpu-3", "cpu-4"):
         if platform.machine().lower() not in ("aarch64", "arm64"):
             pytest.skip("NEON CPU variants require a 64-bit ARM machine")
-        if importlib.util.find_spec(f"codegemm_cpu_kernel_{backend[-1]}") is None:
+    if backend != "cpu-1":
+        if importlib.util.find_spec(cpu_extension_name(backend)) is None:
             pytest.skip(f"Build the optional {backend} extension to run this case")
     return backend
 
@@ -398,8 +400,8 @@ def test_numbered_neon_backends_reject_non_arm_hosts():
 
 
 def test_threaded_variants_are_stable_across_worker_counts(cpu_backend):
-    if cpu_backend not in ("cpu-3", "cpu-4"):
-        pytest.skip("Only variants 3 and 4 have parallel custom loops")
+    if cpu_backend not in ("cpu-1-mt", "cpu-3", "cpu-4"):
+        pytest.skip("Only cpu-1-mt, cpu-3 and cpu-4 have parallel custom loops")
     layer, indices = make_case(bias=True, out_features=131, backend=cpu_backend)
     inputs = torch.linspace(-1, 1, layer.in_features).reshape(1, 1, -1)
     expected = expected_output(layer, indices, inputs)
@@ -416,3 +418,32 @@ def test_threaded_variants_are_stable_across_worker_counts(cpu_backend):
         torch.set_num_threads(previous_threads)
     for result in results[1:]:
         torch.testing.assert_close(result, results[0], rtol=0, atol=0)
+
+
+def test_scalar_mt_preserves_original_scalar_arithmetic(cpu_backend):
+    if cpu_backend != "cpu-1-mt":
+        pytest.skip("This comparison checks the scalar threaded control")
+    from codegemm.inference.cpu_ops import _cpu_extension
+
+    # A single checkpoint must produce the same scalar dot products and row
+    # accumulation order even when independent rows/tables run concurrently.
+    layer, _ = make_case(bias=True, out_features=137, backend="cpu-1")
+    baseline = _cpu_extension("cpu-1")
+    threaded = _cpu_extension("cpu-1-mt")
+    inputs = torch.linspace(-1, 1, layer.in_features)
+    arguments = (layer.codes, layer.scales, layer.codebooks, layer.group_size)
+    expected_vector = baseline.gemv(inputs, *arguments)
+    expected_block = baseline.dequantize_block(*arguments, 5, 134)
+    previous_threads = torch.get_num_threads()
+    try:
+        for count in (1, 2, 4, 8):
+            torch.set_num_threads(count)
+            torch.testing.assert_close(
+                threaded.gemv(inputs, *arguments), expected_vector, rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                threaded.dequantize_block(*arguments, 5, 134), expected_block,
+                rtol=0, atol=0,
+            )
+    finally:
+        torch.set_num_threads(previous_threads)

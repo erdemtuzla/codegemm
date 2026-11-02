@@ -17,7 +17,7 @@ from codegemm.inference import cpu_backends, cpu_ops
 @pytest.mark.parametrize(
     "requested,canonical,device",
     [("cpu", "cpu-1", "cpu"), ("cuda", "cuda", "cuda")]
-    + [(f"cpu-{index}", f"cpu-{index}", "cpu") for index in range(1, 5)],
+    + [(name, name, "cpu") for name in cpu_backends.CPU_BACKENDS],
 )
 def test_backend_names_are_distinct_from_devices(requested, canonical, device):
     assert cpu_backends.canonical_backend(requested) == canonical
@@ -30,7 +30,7 @@ def test_cpu_thread_defaults_respect_pi_budget_and_affinity(monkeypatch):
     monkeypatch.setattr(cpu_backends.os, "sched_getaffinity", lambda _: {0, 1})
     for backend in ("cpu", "cpu-1", "cpu-2"):
         assert cpu_backends.default_cpu_threads(backend) == 1
-    for backend in ("cpu-3", "cpu-4"):
+    for backend in ("cpu-1-mt", "cpu-3", "cpu-4"):
         assert cpu_backends.default_cpu_threads(backend) == 2
         with pytest.warns(UserWarning, match="capping"):
             assert cpu_backends.resolve_cpu_threads(backend, 8) == 4
@@ -58,18 +58,21 @@ def test_wrong_variant_binary_is_rejected(monkeypatch):
 
 @pytest.mark.parametrize("backend", cpu_backends.CPU_BACKENDS)
 def test_compiled_metadata_matches_requested_experiment(backend):
-    if backend != "cpu-1":
+    if backend in ("cpu-2", "cpu-3", "cpu-4"):
         if platform.machine().lower() not in ("aarch64", "arm64"):
             pytest.skip("Native NEON execution requires AArch64")
+    if backend != "cpu-1":
         if importlib.util.find_spec(cpu_backends.cpu_extension_name(backend)) is None:
             pytest.skip(f"Optional extension {backend} has not been built")
     info = cpu_ops.cpu_backend_info(backend)
-    index = int(backend[-1])
+    neon = backend in ("cpu-2", "cpu-3", "cpu-4")
+    threaded = backend in ("cpu-1-mt", "cpu-3", "cpu-4")
+    optimized = backend == "cpu-4"
     assert info["backend"] == backend
-    assert info["neon"] is (index >= 2)
-    assert info["multithreaded"] is (index >= 3)
-    assert info["optimized"] is (index == 4)
-    assert info["optimization_level"] == ("O3" if index == 4 else "O0")
-    assert info["max_threads"] == (4 if index >= 3 else 1)
+    assert info["neon"] is neon
+    assert info["multithreaded"] is threaded
+    assert info["optimized"] is optimized
+    assert info["optimization_level"] == ("O3" if optimized else "O0")
+    assert info["max_threads"] == (4 if threaded else 1)
     assert "-ffast-math" not in info["compiler_flags"].split()
-    assert ("-O3" if index == 4 else "-O0") in info["compiler_flags"].split()
+    assert ("-O3" if optimized else "-O0") in info["compiler_flags"].split()

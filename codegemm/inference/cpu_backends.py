@@ -10,10 +10,13 @@ import platform
 import warnings
 
 
-CPU_BACKENDS = ("cpu-1", "cpu-2", "cpu-3", "cpu-4")
+# cpu-1-mt is the scalar, threaded control for cpu-3. It deliberately stays
+# usable on x86 as well as ARM; only the NEON variants require ARM hardware.
+CPU_BACKENDS = ("cpu-1", "cpu-1-mt", "cpu-2", "cpu-3", "cpu-4")
 BACKEND_CHOICES = ("cuda", "cpu", *CPU_BACKENDS)
 _EXTENSION_NAMES = {
     "cpu-1": "codegemm_cpu_kernel",
+    "cpu-1-mt": "codegemm_cpu_kernel_1_mt",
     "cpu-2": "codegemm_cpu_kernel_2",
     "cpu-3": "codegemm_cpu_kernel_3",
     "cpu-4": "codegemm_cpu_kernel_4",
@@ -32,7 +35,7 @@ def is_cpu_backend(backend):
 
 
 def backend_device_type(backend):
-    """All four CPU implementations use ordinary CPU tensors."""
+    """All CPU implementations use ordinary CPU tensors."""
     return "cpu" if is_cpu_backend(backend) else "cuda"
 
 
@@ -82,7 +85,7 @@ def resolve_cpu_threads(backend, requested=None):
         return default_cpu_threads(backend)
     if requested < 1:
         raise ValueError("CPU thread count must be positive")
-    if backend in ("cpu-3", "cpu-4") and requested > 4:
+    if backend in ("cpu-1-mt", "cpu-3", "cpu-4") and requested > 4:
         warnings.warn(
             f"{backend} is designed for the Pi 5's four cores; capping the "
             "custom kernels and framework CPU thread setting at 4.",

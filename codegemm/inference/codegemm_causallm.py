@@ -100,6 +100,21 @@ def swap_quant_model(
                 _replace_module(parent, target_name, new_module, target)
                 torch.cuda.empty_cache()
 
+def _avoid_onednn_for_single_token(linear):
+    # The FP32 lm_head stays unquantized and uses PyTorch matmul. On AArch64,
+    # oneDNN is ~5x slower than the plain path for one vector times a large
+    # matrix, but faster for multi-token prompts, so only bypass it per token.
+    original_forward = linear.forward
+
+    def forward(x):
+        if x.numel() == linear.in_features:
+            with torch.backends.mkldnn.flags(enabled=False):
+                return original_forward(x)
+        return original_forward(x)
+
+    linear.forward = forward
+
+
 class CodeGEMMForCausalLM(nn.Module):
     def __init__(
             self,
@@ -190,6 +205,9 @@ class CodeGEMMForCausalLM(nn.Module):
             device_map=device_map,
             dtype=torch_dtype,
         )
+
+        if is_cpu_backend(self.backend):
+            _avoid_onednn_for_single_token(self.model.lm_head)
 
         # Dispath to devices
         if fuse_layers:
